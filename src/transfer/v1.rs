@@ -5,6 +5,67 @@ use std::path::PathBuf;
 
 use super::*;
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub enum Offer {
+    Message(String),
+    File {
+        filename: PathBuf,
+        filesize: u64,
+    },
+    Directory {
+        dirname: PathBuf,
+        mode: String,
+        zipsize: u64,
+        numbytes: u64,
+        numfiles: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    MessageAck(String),
+    FileAck(String),
+}
+
+/**
+ * A set of hints for both sides to find each other
+ */
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct TransitV1 {
+    pub abilities_v1: TransitAbilities,
+    pub hints_v1: transit::Hints,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+struct TransitAck {
+    pub ack: String,
+    pub sha256: String,
+}
+
+impl TransitAck {
+    pub fn new(msg: impl Into<String>, sha256: impl Into<String>) -> Self {
+        TransitAck {
+            ack: msg.into(),
+            sha256: sha256.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn serialize(&self) -> String {
+        json!(self).to_string()
+    }
+
+    pub fn serialize_vec(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap()
+    }
+}
+
 pub async fn send_file<F, N, G, H>(
     mut wormhole: Wormhole,
     relay_hints: Vec<transit::RelayHint>,
@@ -42,13 +103,10 @@ where
 
         // Wait for their transit response
         let (their_abilities, their_hints): (transit::Abilities, transit::Hints) =
-            match wormhole.receive_json().await?? {
+        match wormhole.receive_json::<PeerMessage>().await??.check_err()? {
                 PeerMessage::Transit(transit) => {
                     debug!("Received transit message: {:?}", transit);
                     (transit.abilities_v1, transit.hints_v1)
-                },
-                PeerMessage::Error(err) => {
-                    bail!(TransferError::PeerError(err));
                 },
                 other => {
                     bail!(TransferError::unexpected_message("transit", other))
@@ -57,15 +115,12 @@ where
 
         {
             // Wait for file_ack
-            let fileack_msg = wormhole.receive_json().await??;
+            let fileack_msg = wormhole.receive_json::<PeerMessage>().await??;
             debug!("Received file ack message: {:?}", fileack_msg);
 
-            match fileack_msg {
+            match fileack_msg.check_err()? {
                 PeerMessage::Answer(Answer::FileAck(msg)) => {
                     ensure!(msg == "ok", TransferError::AckError);
-                },
-                PeerMessage::Error(err) => {
-                    bail!(TransferError::PeerError(err));
                 },
                 _ => {
                     bail!(TransferError::unexpected_message(
@@ -203,13 +258,10 @@ where
 
         // Wait for their transit response
         let (their_abilities, their_hints): (transit::Abilities, transit::Hints) =
-            match wormhole.receive_json().await?? {
+            match wormhole.receive_json::<PeerMessage>().await??.check_err()? {
                 PeerMessage::Transit(transit) => {
                     debug!("received transit message: {:?}", transit);
                     (transit.abilities_v1, transit.hints_v1)
-                },
-                PeerMessage::Error(err) => {
-                    bail!(TransferError::PeerError(err));
                 },
                 other => {
                     bail!(TransferError::unexpected_message("transit", other));
@@ -217,12 +269,9 @@ where
             };
 
         // Wait for file_ack
-        match wormhole.receive_json().await?? {
+        match wormhole.receive_json::<PeerMessage>().await??.check_err()? {
             PeerMessage::Answer(Answer::FileAck(msg)) => {
                 ensure!(msg == "ok", TransferError::AckError);
-            },
-            PeerMessage::Error(err) => {
-                bail!(TransferError::PeerError(err));
             },
             other => {
                 bail!(TransferError::unexpected_message("answer/file_ack", other));
@@ -322,6 +371,178 @@ where
     futures::pin_mut!(cancel);
     let result = crate::util::cancellable_2(run, cancel).await;
     super::handle_run_result(wormhole, result).await
+}
+
+/**
+ * Wait for a file offer from the other side
+ *
+ * This method waits for an offer message and builds up a [`ReceiveRequest`](ReceiveRequest).
+ * It will also start building a TCP connection to the other side using the transit protocol.
+ *
+ * Returns `None` if the task got cancelled.
+ */
+pub async fn request_file(
+    mut wormhole: Wormhole,
+    relay_url: url::Url,
+    transit_abilities: transit::Abilities,
+    cancel: impl Future<Output = ()>,
+) -> Result<Option<ReceiveRequest>, TransferError> {
+    // Error handling
+    let run = Box::pin(async {
+        let relay_hints = vec![transit::RelayHint::from_urls(None, [relay_url])];
+        let connector = transit::init(transit_abilities, None, relay_hints).await?;
+
+        // send the transit message
+        debug!("Sending transit message '{:?}", connector.our_hints());
+        wormhole
+            .send_json(&PeerMessage::transit(
+                *connector.our_abilities(),
+                (**connector.our_hints()).clone(),
+            ))
+            .await?;
+
+        // receive transit message
+        let (their_abilities, their_hints): (transit::Abilities, transit::Hints) =
+            match wormhole.receive_json::<PeerMessage>().await??.check_err()? {
+                PeerMessage::Transit(transit) => {
+                    debug!("received transit message: {:?}", transit);
+                    (transit.abilities_v1, transit.hints_v1)
+                },
+                other => {
+                    bail!(TransferError::unexpected_message("transit", other));
+                },
+            };
+
+        // 3. receive file offer message from peer
+        let (filename, filesize) = match wormhole.receive_json::<PeerMessage>().await??.check_err()? {
+            PeerMessage::Offer(offer_type) => match offer_type {
+                v1::Offer::File { filename, filesize } => (filename, filesize),
+                v1::Offer::Directory {
+                    mut dirname,
+                    zipsize,
+                    ..
+                } => {
+                    dirname.set_extension("zip");
+                    (dirname, zipsize)
+                },
+                _ => bail!(TransferError::UnsupportedOffer),
+            },
+            other => {
+                bail!(TransferError::unexpected_message("offer", other));
+            },
+        };
+
+        Ok((filename, filesize, connector, their_abilities, their_hints))
+    });
+
+    match crate::util::cancellable(run, cancel).await {
+        Ok(Ok((filename, filesize, connector, their_abilities, their_hints))) => {
+            Ok(Some(ReceiveRequest {
+                wormhole,
+                filename,
+                filesize,
+                connector,
+                their_abilities,
+                their_hints: Arc::new(their_hints),
+            }))
+        },
+        Ok(Err(error @ TransferError::PeerError(_))) => Err(error),
+        Ok(Err(error)) => {
+            let _ = wormhole
+                .send_json(&PeerMessage::Error(format!("{}", error)))
+                .await;
+            Err(error)
+        },
+        Err(cancelled) => {
+            let _ = wormhole
+                .send_json(&PeerMessage::Error(format!("{}", cancelled)))
+                .await;
+            Ok(None)
+        },
+    }
+}
+
+/**
+ * A pending files send offer from the other side
+ *
+ * You *should* consume this object, either by calling [`accept`](ReceiveRequest::accept) or [`reject`](ReceiveRequest::reject).
+ */
+pub struct ReceiveRequest {
+    wormhole: Wormhole,
+    connector: TransitConnector,
+    /// **Security warning:** this is untrusted and unverified input
+    pub filename: PathBuf,
+    pub filesize: u64,
+    their_abilities: transit::Abilities,
+    their_hints: Arc<transit::Hints>,
+}
+
+impl ReceiveRequest {
+    /**
+     * Accept the file offer
+     *
+     * This will transfer the file and save it on disk.
+     */
+    pub async fn accept<F, G, W>(
+        mut self,
+        transit_handler: G,
+        progress_handler: F,
+        content_handler: &mut W,
+        cancel: impl Future<Output = ()>,
+    ) -> Result<(), TransferError>
+    where
+        F: FnMut(u64, u64) + 'static,
+        G: FnOnce(transit::TransitInfo, std::net::SocketAddr),
+        W: AsyncWrite + Unpin,
+    {
+        let run = Box::pin(async {
+            // send file ack.
+            debug!("Sending ack");
+            self.wormhole
+                .send_json(&PeerMessage::file_ack("ok"))
+                .await?;
+
+            let (mut transit, info, addr) = self
+                .connector
+                .follower_connect(
+                    self.wormhole
+                        .key()
+                        .derive_transit_key(self.wormhole.appid()),
+                    self.their_abilities,
+                    self.their_hints.clone(),
+                )
+                .await?;
+            transit_handler(info, addr);
+
+            debug!("Beginning file transfer");
+            tcp_file_receive(
+                &mut transit,
+                self.filesize,
+                progress_handler,
+                content_handler,
+            )
+            .await?;
+            Ok(())
+        });
+
+        futures::pin_mut!(cancel);
+        let result = crate::util::cancellable_2(run, cancel).await;
+        handle_run_result(self.wormhole, result).await
+    }
+
+    /**
+     * Reject the file offer
+     *
+     * This will send an error message to the other side so that it knows the transfer failed.
+     */
+    pub async fn reject(mut self) -> Result<(), TransferError> {
+        self.wormhole
+            .send_json(&PeerMessage::error_message("transfer rejected"))
+            .await?;
+        self.wormhole.close().await?;
+
+        Ok(())
+    }
 }
 
 // encrypt and send the file to tcp stream and return the sha256 sum
@@ -452,4 +673,15 @@ where
     // well, no need, it gets dropped when it goes out of scope.
     debug!("Transfer complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_transit_ack() {
+        let f1 = TransitAck::new("ok", "deadbeaf");
+        assert_eq!(f1.serialize(), "{\"ack\":\"ok\",\"sha256\":\"deadbeaf\"}");
+    }
 }
