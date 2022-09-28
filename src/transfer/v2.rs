@@ -449,7 +449,7 @@ where
     F: AsyncWrite + AsyncSeek + Unpin,
     H: FnMut(u64, u64) + 'static,
 {
-
+/*
     for i in 0..todo!() {
         let mut content = content(i);
         let fileStart = match PeerMessageV2::de_msgpack(&transit.receive_record().await?)?.check_err()? {
@@ -489,7 +489,7 @@ where
                 bail!(TransferError::unexpected_message("file-end", other))
             },
         };
-    }
+    }*/
 
     todo!()
 }

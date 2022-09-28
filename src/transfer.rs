@@ -18,6 +18,7 @@ use super::{core::WormholeError, transit,  AppID, Wormhole};
 use futures::Future;
 use log::*;
 use std::{borrow::Cow, path::PathBuf};
+use std::pin::Pin;
 use transit::{Transit, TransitConnectError, TransitConnector, TransitError, Abilities as TransitAbilities};
 
 mod messages;
@@ -248,10 +249,10 @@ impl PeerMessage {
         PeerMessage::TransitV2(v2::TransitV2 { hints_v2 })
     }
 
-    pub fn check_err(self) -> Result<Self, TransferError> {
+    pub fn check_err(&self) -> Result<Self, TransferError> {
         match self {
-            Self::Error(err) => Err(TransferError::PeerError(err)),
-            other => Ok(other),
+            Self::Error(err) => Err(TransferError::PeerError(err.clone())),
+            other => Ok(other.clone()),
         }
     }
 
@@ -281,45 +282,47 @@ pub enum Offer {
 }
 
 impl Offer {
-    pub async fn new(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        let metadata = async_std::fs::symlink_metadata(path).await?;
-        let name = path.file_name().expect("TODO error handling").to_str().expect("TODO error handling").to_owned();
-        let mtime = metadata.modified()?
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if metadata.is_file() {
-            Ok(Self::RegularFile {
-                name,
-                mtime,
-                size: metadata.len(),
-            })
-        } else if metadata.is_symlink() {
-            let target = async_std::fs::read_link(path).await?;
-            Ok(Self::Symlink {
-                name,
-                mtime,
-                target: target.to_str().expect("TODO error handling").to_string(),
-            })
-        } else if metadata.is_dir() {
-            use futures::{StreamExt, TryStreamExt};
-
-            let content = async_std::fs::read_dir(path)
-                .await?
-                .and_then(|file| async move {
-                    Self::new(file.path()).await
+    pub fn new(path: impl AsRef<std::path::Path>) -> Pin<Box<dyn Future<Output=std::io::Result<Self>>>> {
+        Box::pin(async {
+            let path = path.as_ref();
+            let metadata = async_std::fs::symlink_metadata(path).await?;
+            let name = path.file_name().expect("TODO error handling").to_str().expect("TODO error handling").to_owned();
+            let mtime = metadata.modified()?
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if metadata.is_file() {
+                Ok(Self::RegularFile {
+                    name,
+                    mtime,
+                    size: metadata.len(),
                 })
-                .collect::<Result<Vec<Offer>, std::io::Error>>()
-                .await?;
-            Ok(Self::Directory {
-                name,
-                mtime,
-                content,
-            })
-        } else {
-            unreachable!()
-        }
+            } else if metadata.is_symlink() {
+                let target = async_std::fs::read_link(path).await?;
+                Ok(Self::Symlink {
+                    name,
+                    mtime,
+                    target: target.to_str().expect("TODO error handling").to_string(),
+                })
+            } else if metadata.is_dir() {
+                use futures::{StreamExt, TryStreamExt};
+
+                let content: Vec<Offer> = async_std::fs::read_dir(path)
+                    .await?
+                    .and_then(|file| async move {
+                        Self::new(file.path()).await
+                    })
+                    .try_collect()
+                    .await?;
+                Ok(Self::Directory {
+                    name,
+                    mtime,
+                    content,
+                })
+            } else {
+                unreachable!()
+            }
+        })
     }
 
     /** Recursively list all file paths, without directory names or symlinks. */
@@ -538,8 +541,8 @@ impl ReceiveRequest {
         W: AsyncWrite + Unpin,
     {
         match self.0 {
-            ReceiveRequestInner::V1(req) => req.accept().await,
-            ReceiveRequestInner::V2(req) => req.accept().await,
+            ReceiveRequestInner::V1(req) => req.accept(transit_handler, progress_handler, content_handler, cancel).await,
+            ReceiveRequestInner::V2(req) => req.accept(transit_handler, content_handler, progress_handler).await,
         }
     }
 
